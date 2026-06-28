@@ -30,6 +30,10 @@ const RECORDER_SCRIPT_PATH = process.env.RECORDER_SCRIPT_PATH || null;
 const ENABLE_RECORDER_SCRIPT = process.env.ENABLE_RECORDER_SCRIPT || '0';
 const HA_USERNAME = process.env.HA_USERNAME || null;
 const HA_PASSWORD = process.env.HA_PASSWORD || null;
+// Optional dashboard rotation: comma-separated Lovelace paths to cycle through,
+// and how many seconds to show each. Rotation is disabled unless >1 path is given.
+const ROTATE_PATHS = process.env.ROTATE_PATHS || null;
+const ROTATE_INTERVAL = parseInt(process.env.ROTATE_INTERVAL) || 30;
 
 // Environment variables which can be overriden from the API
 let kioskMode = process.env.KIOSK || '0';
@@ -311,6 +315,27 @@ async function executeRecorderScript(port) {
         console.log("✓ Navigation complete");
       } else {
         console.log("No final navigation step found in recording");
+      }
+    }
+
+    // Optional: rotate between multiple dashboard views in-page (no reload, no re-login).
+    // Self-disables when ROTATE_PATHS is unset or lists a single path.
+    if (ROTATE_PATHS) {
+      const paths = ROTATE_PATHS.split(',').map(p => p.trim()).filter(Boolean);
+      if (paths.length > 1) {
+        console.log(`Enabling dashboard rotation across ${paths.length} views every ${ROTATE_INTERVAL}s`);
+        await page.evaluate((paths, intervalMs) => {
+          // Clear any prior timer in case this page already had rotation installed
+          if (window.__dashRotateTimer) clearInterval(window.__dashRotateTimer);
+          let i = 0;
+          window.__dashRotateTimer = setInterval(() => {
+            i = (i + 1) % paths.length;
+            history.pushState(null, "", paths[i]);
+            window.dispatchEvent(new Event("location-changed")); // HA re-renders the view
+          }, intervalMs);
+        }, paths, ROTATE_INTERVAL * 1000);
+      } else {
+        console.log("Dashboard rotation not enabled (ROTATE_PATHS needs more than one path)");
       }
     }
 
