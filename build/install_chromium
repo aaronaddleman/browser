@@ -22,6 +22,14 @@ then
 
     cp -a "${BASE_DIR}/rpi/raspi.list" "/etc/apt/sources.list.d/"
     cp -a "${BASE_DIR}/rpi/raspberrypi-archive-stable.gpg" "/etc/apt/trusted.gpg.d/"
+
+    # Debian 13 rejects SHA1 signatures from 2026-02-01. The Raspberry Pi
+    # archive key's self-signature still uses SHA1, so apt's verifier (sqv)
+    # treats the repo as unsigned. Install a Sequoia crypto-policy that
+    # re-allows SHA1 so the key validates, keeping signature verification on.
+    mkdir -p /etc/crypto-policies/back-ends
+    cp -a "${BASE_DIR}/rpi/sequoia-sha1.config" "/etc/crypto-policies/back-ends/sequoia.config"
+    export SEQUOIA_CRYPTO_POLICY="${BASE_DIR}/rpi/sequoia-sha1.config"
 fi
 
 # The node library launches /usr/bin/chromium-browser

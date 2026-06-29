@@ -94,6 +94,8 @@ The following environment variables allow configuration of the `browser` block:
 |`API_PORT`|port number|5011|Specifies the port number the API runs on|
 |`REMOTE_DEBUG_PORT`|port number|35173|Specifies the port number the chrome remote debugger runs on|
 |`AUTO_REFRESH`|interval|0 (disabled)|Specifies the number of seconds before the page automatically refreshes|
+|`ROTATE_PATHS`|comma-separated paths|N\A|Cycles through multiple in-app paths (e.g. Home Assistant Lovelace views) without reloading or re-authenticating. Enter two or more comma-separated paths, e.g. `/lovelace-tvboard/tvboard,/lovelace-tvboard/view2`. Rotation is automatically disabled if fewer than two paths are given. **Requires `ENABLE_RECORDER_SCRIPT=1`** as it is injected after the recorder script runs|
+|`ROTATE_INTERVAL`|`n` (seconds)|`30`|Number of seconds to display each path before rotating. Only used when `ROTATE_PATHS` has more than one path|
 
 ---
 
