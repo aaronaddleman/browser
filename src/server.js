@@ -4,8 +4,9 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const chromeLauncher = require('chrome-launcher');
 const puppeteer = require('puppeteer-core');
-const { createRunner, PuppeteerRunnerExtension } = require('@puppeteer/replay');
 const bent = require('bent')
+const mdns = require('./mdns');
+const recorder = require('./recorder');
 const {
   setIntervalAsync,
   clearIntervalAsync
@@ -31,6 +32,15 @@ const ENABLE_RECORDER_SCRIPT = process.env.ENABLE_RECORDER_SCRIPT || '0';
 const HA_USERNAME = process.env.HA_USERNAME || null;
 const HA_PASSWORD = process.env.HA_PASSWORD || null;
 
+// mDNS / DNS-SD configuration
+const MDNS_ADVERTISE = process.env.MDNS_ADVERTISE || '1';
+const MDNS_NAME = process.env.MDNS_NAME || process.env.BALENA_DEVICE_NAME_AT_INIT || os.hostname() || 'balena-browser';
+const MDNS_DISCOVER = process.env.MDNS_DISCOVER || '0';
+const MDNS_DISCOVER_NAME = process.env.MDNS_DISCOVER_NAME || null;
+const MDNS_DISCOVER_TYPE = process.env.MDNS_DISCOVER_TYPE || 'http';
+const MDNS_DISCOVER_PATH = process.env.MDNS_DISCOVER_PATH || null;
+const MDNS_DISCOVER_TIMEOUT = parseInt(process.env.MDNS_DISCOVER_TIMEOUT) || 5;
+
 // Environment variables which can be overriden from the API
 let kioskMode = process.env.KIOSK || '0';
 let enableGpu = process.env.ENABLE_GPU || '0';
@@ -44,8 +54,9 @@ let timer = {};
 
 // Returns the URL to display, adhering to the hieracrchy:
 // 1) the configured LAUNCH_URL
-// 2) a discovered HTTP service on the device
-// 3) the default static HTML
+// 2) an HTTP service discovered on the LAN via mDNS (if MDNS_DISCOVER=1)
+// 3) a discovered HTTP service on the device
+// 4) the default static HTML
 async function getUrlToDisplayAsync() {
   let launchUrl = process.env.LAUNCH_URL || null;
     if (null !== launchUrl)
@@ -62,6 +73,30 @@ async function getUrlToDisplayAsync() {
     }
 
     console.log("LAUNCH_URL environment variable not set.")
+
+    // Optionally browse the LAN for a service advertised over mDNS.
+    if (MDNS_DISCOVER === '1') {
+      console.log(
+        `Looking for an mDNS "_${MDNS_DISCOVER_TYPE}._tcp" service on the LAN` +
+        (MDNS_DISCOVER_NAME ? ` named "${MDNS_DISCOVER_NAME}"` : '')
+      );
+      try {
+        const discovered = await mdns.discoverUrl({
+          type: MDNS_DISCOVER_TYPE,
+          name: MDNS_DISCOVER_NAME,
+          path: MDNS_DISCOVER_PATH,
+          timeoutMs: MDNS_DISCOVER_TIMEOUT * 1000,
+        });
+        if (discovered) {
+          console.log(`mDNS service found at: ${discovered}`);
+          return discovered;
+        }
+        console.log("No matching mDNS service found on the LAN");
+      } catch (e) {
+        console.log(`mDNS discovery error: ${e.message}`);
+      }
+    }
+
     console.log("Looking for local HTTP/S services.")
 
     // make a HTTP/S request for each supported port to the localhost
@@ -254,49 +289,55 @@ async function executeRecorderScript(port) {
     console.log(`  On auth page: ${isOnAuthPage}`);
     console.log(`  Needs login: ${needsLogin}`);
 
+    // Retarget helper shared with the login-preparation logic (see src/recorder.js).
+    const { retargetUrl } = recorder.computeRetarget(recording, pageUrl, console.log);
+
     if (needsLogin) {
-      console.log("Login required - executing full recorder script");
+      let loggedIn = false;
 
-      // Replace username and password placeholders with environment variables
-      if (HA_USERNAME || HA_PASSWORD) {
-        console.log("Replacing credentials with environment variables...");
-        let replacedCount = 0;
-
-        recording.steps.forEach((step, index) => {
-          if (step.type === 'change' && step.value) {
-            // Check if this is a username or password field based on selectors
-            const selectors = JSON.stringify(step.selectors || []).toLowerCase();
-
-            if (HA_USERNAME && selectors.includes('username')) {
-              console.log(`  ✓ Replacing username in step ${index + 1}`);
-              step.value = HA_USERNAME;
-              replacedCount++;
-            } else if (HA_PASSWORD && selectors.includes('password')) {
-              console.log(`  ✓ Replacing password in step ${index + 1}`);
-              step.value = HA_PASSWORD;
-              replacedCount++;
+      // Primary path: direct credential login using shadow-piercing selectors.
+      // Robust against web-component/shadow-DOM login forms (e.g. Home Assistant)
+      // where recorded CSS selectors can't reach the real <input> elements. On
+      // success the auth flow's redirect_uri returns to the requested dashboard.
+      if (HA_USERNAME && HA_PASSWORD) {
+        try {
+          console.log("Attempting direct credential login...");
+          loggedIn = await recorder.smartLogin({
+            page, username: HA_USERNAME, password: HA_PASSWORD, timeout: 20000, log: console.log,
+          });
+          if (loggedIn) {
+            console.log("✓ Logged in via direct credential fill.");
+            // The auth redirect returns to the dashboard but drops query params
+            // (e.g. ?kiosk that hides the HA sidebar). Re-open the exact display
+            // URL so those params take effect.
+            if (currentUrl) {
+              try {
+                console.log(`Re-opening display URL: ${currentUrl}`);
+                await page.goto(currentUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+              } catch (e) {
+                console.log(`Post-login navigation warning: ${e.message}`);
+              }
             }
+          } else {
+            console.log("Direct login did not complete - falling back to recorded script.");
           }
-        });
-
-        console.log(`✓ Replaced ${replacedCount} credential value(s)`);
+        } catch (e) {
+          console.log(`Direct login unavailable (${e.message}) - falling back to recorded script.`);
+        }
       } else {
-        console.log("⚠ No HA_USERNAME or HA_PASSWORD environment variables set - using values from recording file");
+        console.log("⚠ No HA_USERNAME or HA_PASSWORD set - using the recorded script's values.");
       }
 
-      console.log("Creating Puppeteer runner...");
-      // Create a runner for the recording
-      const runner = await createRunner(recording, new PuppeteerRunnerExtension(browser, page, {
-        timeout: 30000
-      }));
-      console.log("✓ Runner created");
-
-      console.log("========================================");
-      console.log("EXECUTING RECORDED ACTIONS...");
-      console.log("========================================");
-
-      // Execute the recording
-      await runner.run();
+      // Fallback: replay the recording (retargeted, credentials injected).
+      if (!loggedIn) {
+        recorder.prepareLoginRecording(recording, {
+          pageUrl, username: HA_USERNAME, password: HA_PASSWORD, log: console.log,
+        });
+        console.log("========================================");
+        console.log("EXECUTING RECORDED ACTIONS...");
+        console.log("========================================");
+        await recorder.runLoginRecording({ browser, page, recording, timeout: 30000, log: console.log });
+      }
     } else {
       console.log("Already logged in (persistent session detected) - skipping login steps");
 
@@ -306,8 +347,9 @@ async function executeRecorderScript(port) {
         .pop();
 
       if (finalNavStep && finalNavStep.url) {
-        console.log(`Navigating directly to: ${finalNavStep.url}`);
-        await page.goto(finalNavStep.url, { waitUntil: 'networkidle0', timeout: 30000 });
+        const target = retargetUrl(finalNavStep.url);
+        console.log(`Navigating directly to: ${target}`);
+        await page.goto(target, { waitUntil: 'networkidle0', timeout: 30000 });
         console.log("✓ Navigation complete");
       } else {
         console.log("No final navigation step found in recording");
@@ -547,10 +589,45 @@ app.post('/scan', (req, res) => {
   return res.status(200).send('ok');
 });
 
+// mDNS endpoint - reports what we advertise and what we can currently see
+app.get('/mdns', async (req, res) => {
+  try {
+    const services = await mdns.browse({
+      type: MDNS_DISCOVER_TYPE,
+      timeoutMs: MDNS_DISCOVER_TIMEOUT * 1000,
+    });
+    return res.status(200).json({
+      advertising: MDNS_ADVERTISE === '1'
+        ? { name: MDNS_NAME, type: '_http._tcp', port: API_PORT }
+        : null,
+      discovered: services.map((s) => ({
+        name: s.name,
+        host: s.host,
+        port: s.port,
+        addresses: s.addresses,
+        fqdn: s.fqdn,
+        url: mdns.serviceToUrl(s),
+      })),
+    });
+  } catch (e) {
+    return res.status(500).send('mDNS error: ' + e.message);
+  }
+});
+
 app.listen(API_PORT, () => {
   console.log('Browser API running on port: ' + API_PORT);
+
+  // Advertise this device's API on the LAN over mDNS.
+  if (MDNS_ADVERTISE === '1') {
+    mdns.advertise({
+      name: MDNS_NAME,
+      port: API_PORT,
+      txt: { role: 'balena-browser' },
+    });
+  }
 });
 
 process.on('SIGINT', () => {
+  mdns.stop();
   process.exit();
 });
